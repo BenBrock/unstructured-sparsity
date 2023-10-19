@@ -1,42 +1,37 @@
 #include <cuda.h>
 #include <cstdint>
 #include <cstdio>
+#include <chrono>
 
 #include <cub/cub.cuh>
 
 #include "generate.hpp"
 
-#define CHECK_CUDA(ans) { gpuAssert((ans), __FILE__, __LINE__); }
-inline void gpuAssert(cudaError_t code, const char *file, int line, bool abort=true)
-{
-   if (code != cudaSuccess) 
-   {
-      fprintf(stderr,"GPUassert: %s %s %d\n", cudaGetErrorString(code), file, line);
-      if (abort) exit(code);
-   }
-}
-
 inline constexpr auto warp_size = 32;
-
 inline constexpr auto block_size = 128;
 
 extern __shared__ char shared_memory[];
 
+// `packed_values` is an array: [packed_values, packed_values + nnz)
+// `filled` is an array of bits: [filled, filled + n)
+
 template <typename T, typename I>
-__device__ auto sparse_iteration_block(T* packed_values, I* filled, std::size_t num_values) {
+__device__ auto sparse_iteration_block(T* packed_values, I* filled, std::size_t n) {
   auto tid = threadIdx.x;
 
   using indices_type = int;
 
+  auto bits_per_word = sizeof(I)*8;
+
   indices_type* indices = (indices_type*) shared_memory;
 
   // indices[idx] = idx'th set bit of `filled`
-  if (tid < num_values) {
+  if (tid < n) {
     auto idx = tid;
 
     // Check the idx'th bit of `filled`
-    auto element = idx / (sizeof(std::uint64_t)*8);
-    auto bit = idx % (sizeof(std::uint64_t)*8);
+    auto element = idx / bits_per_word;
+    auto bit = idx % bits_per_word;
     bool has_value = (0x1 << bit) & filled[element];
 
     if (has_value) {
@@ -51,35 +46,51 @@ __device__ auto sparse_iteration_block(T* packed_values, I* filled, std::size_t 
   typedef cub::BlockScan<I, block_size> BlockScan;
   __shared__ typename BlockScan::TempStorage temp_storage;
 
-  if (tid < num_values) {
+  if (tid < n) {
     BlockScan(temp_storage).ExclusiveSum(indices[tid], indices[tid]);
   } else {
     int dummy_value = 0;
     BlockScan(temp_storage).ExclusiveSum(dummy_value, dummy_value);
   }
 
-  T* values = (T*) (indices + num_values);
+  T* values = (T*) (indices + n);
 
-  if (tid < num_values) {
+  if (tid < n) {
     values[tid] = packed_values[indices[tid]];
   }
 
-  return indices[num_values-1] - indices[0];
+  auto idx = block_size - 1;
+
+  bool last_filled = (0x1 << (idx % bits_per_word)) & filled[idx / bits_per_word];
+
+  return (indices[n-1] - indices[0]) + last_filled;
 }
 
-// Written for a single warp
 template <typename T, typename I>
-__global__ void sparse_iteration(T* packed_values, I* filled, std::size_t num_values) {
+__global__ void sparse_iteration(T* packed_values, I* filled, std::size_t n) {
+  constexpr bool print = false;
+  auto bits_per_word = sizeof(I)*8;
   if (blockIdx.x == 0) {
-    auto consumed = sparse_iteration_block(packed_values, filled, block_size);
-    if (threadIdx.x == 0)
-      printf("Consumed %d values\n", consumed);
+    std::size_t n_consumed = 0;
+    std::size_t vals_consumed = 0;
+    std::size_t iteration = 0;
+    while (n_consumed < n) {
+      auto consumed = sparse_iteration_block(packed_values + vals_consumed, filled + (n_consumed / bits_per_word), block_size);
+      vals_consumed += consumed;
+      n_consumed += block_size;
+
+      if (threadIdx.x == 0 && print) {
+        printf("Iteration %lu: %d values consumed\n", iteration, consumed);
+      }
+
+      ++iteration;
+    }
   }
 }
 
 int main(int argc, char** argv) {
-  std::size_t m = 1000;
-  std::size_t n = 1000;
+  std::size_t m = 10000;
+  std::size_t n = 10000;
   std::size_t nnz = m*n / 2;
 
   using T = float;
@@ -111,17 +122,43 @@ int main(int argc, char** argv) {
 
   T* a_d;
   I* filled_d;
-  CHECK_CUDA(cudaMalloc(&a_d, m*n*sizeof(T)));
-  CHECK_CUDA(cudaMalloc(&filled_d, num_words*sizeof(I)));
-  CHECK_CUDA(cudaMemcpy(a_d, a.data(), m*n*sizeof(T), cudaMemcpyHostToDevice));
-  CHECK_CUDA(cudaMemcpy(filled_d, filled.data(), num_words*sizeof(I), cudaMemcpyHostToDevice));
-
+  cudaMalloc(&a_d, nnz*sizeof(T));
+  cudaMalloc(&filled_d, num_words*sizeof(I));
+  cudaMemcpy(a_d, a.data(), nnz*sizeof(T), cudaMemcpyHostToDevice);
+  cudaMemcpy(filled_d, filled.data(), num_words*sizeof(I), cudaMemcpyHostToDevice);
   cudaDeviceSynchronize();
 
+  auto begin = std::chrono::high_resolution_clock::now();
   sparse_iteration<<<1, block_size, block_size * (sizeof(T) + sizeof(I))>>>(a_d, filled_d, nnz);
   cudaDeviceSynchronize();
+  auto end = std::chrono::high_resolution_clock::now();
+  double duration = std::chrono::duration<double>(end - begin).count();
 
-  CHECK_CUDA(cudaGetLastError());
+  double mbytes = nnz*sizeof(T) * 1e-6;
+
+  printf("Took %lf ms to decompress %lf MB\n", duration*1000, mbytes);
+  printf("%lf GB/s\n", mbytes / duration);
+
+  std::size_t block_id = 0;
+  for (std::size_t i = 0; i < m*n; i += block_size) {
+    std::size_t count = 0;
+    // printf("Block %lu: \n", block_id);
+    for (std::size_t j = i; j < std::min(m*n, i+block_size); j++) {
+      // Write to the idx'th bit of `filled`
+      auto element = j / bits_per_word;
+      auto bit = j % bits_per_word;
+      bool has_value = filled[element] & (0x1 << bit);
+      // printf("%d ", has_value);
+      if (has_value) {
+        count++;
+      }
+    }
+    // printf("\n");
+    printf("Block %lu has %lu values\n", block_id, count);
+    block_id++;
+    if (block_id > 10)
+      break;
+  }
 
   return 0;
 }
