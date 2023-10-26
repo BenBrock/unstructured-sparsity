@@ -60,25 +60,44 @@ __device__ auto sparse_iteration_block(T* packed_values, I* filled, std::size_t 
     values[tid] = packed_values[indices[tid]];
   }
 
-  auto idx = block_size - 1;
+  auto idx = n - 1;
 
   bool last_filled = (0x1 << (idx % bits_per_word)) & filled[idx / bits_per_word];
 
   return (indices[n-1] - indices[0]) + last_filled;
 }
 
+/*
 template <typename T, typename I>
-__global__ void sparse_iteration(T* packed_values, I* filled, std::size_t n) {
+__device__ void sparse_iteration(T* packed_values, I* filled, std::size_t n) {
+  constexpr auto bits_per_word = sizeof(I)*8;
+
+    std::size_t iteration = 0;
+    std::size_t vals_consumed = 0;
+    for (std::size_t filled_position = 0; filled_position < n; filled_position += block_size) {
+      auto consumed = sparse_iteration_block(packed_values + vals_consumed, filled + (filled_position / bits_per_word), min(block_size, int(n - filled_position)));
+      vals_consumed += consumed;
+
+      if (print && threadIdx.x == 0) {
+        printf("Iteration %lu: %d values consumed\n", iteration, consumed);
+      }
+
+      ++iteration;
+    }
+  }
+}
+*/
+
+template <typename T, typename I>
+__global__ void sparse_iteration(T* packed_values, I* filled, I* block_offsets, std::size_t n) {
   constexpr bool print = false;
   auto bits_per_word = sizeof(I)*8;
   if (blockIdx.x == 0) {
-    std::size_t n_consumed = 0;
-    std::size_t vals_consumed = 0;
     std::size_t iteration = 0;
-    while (n_consumed < n) {
-      auto consumed = sparse_iteration_block(packed_values + vals_consumed, filled + (n_consumed / bits_per_word), block_size);
+    std::size_t vals_consumed = 0;
+    for (std::size_t filled_position = 0; filled_position < n; filled_position += block_size) {
+      auto consumed = sparse_iteration_block(packed_values + vals_consumed, filled + (filled_position / bits_per_word), min(block_size, int(n - filled_position)));
       vals_consumed += consumed;
-      n_consumed += block_size;
 
       if (print && threadIdx.x == 0) {
         printf("Iteration %lu: %d values consumed\n", iteration, consumed);
@@ -90,8 +109,8 @@ __global__ void sparse_iteration(T* packed_values, I* filled, std::size_t n) {
 }
 
 int main(int argc, char** argv) {
-  std::size_t m = 40000;
-  std::size_t n = 40000;
+  std::size_t m = 10000;
+  std::size_t n = 10000;
   std::size_t nnz = 0.5 * m*n;
 
   printf("Generating matrix with %lu nnz (%lf%% filled)\n", nnz, 100*(double(nnz) / (m*n)));
@@ -138,7 +157,6 @@ int main(int argc, char** argv) {
     }
   }
 
-
   std::size_t num_elements = 0;
   for (std::size_t idx = 0; idx < m*n; idx++) {
     auto element = idx / bits_per_word;
@@ -149,18 +167,39 @@ int main(int argc, char** argv) {
     }
   }
 
-  printf("Counted %lu num_elements\n", num_elements);
+  assert(num_elements == nnz);
+
+  std::size_t num_blocks = 8;
+
+  std::size_t elems_per_block = (filled.size() + num_blocks - 1) / num_blocks;
+  std::vector<std::size_t> nnz_per_block(num_blocks, 0);
+
+  for (std::size_t block = 0; block < num_blocks; block++) {
+    for (std::size_t i = elems_per_block*block; i < std::min(m*n, elems_per_block*(block+1)); i++) {
+      nnz_per_block[block] += __builtin_popcount(filled[i]);
+    }
+  }
+
+  std::exclusive_scan(nnz_per_block.begin(), nnz_per_block.end(), nnz_per_block.begin(), std::size_t(0));
+
+  for (std::size_t i = 0; i < nnz_per_block.size(); i++) {
+    printf("%lu ", nnz_per_block[i]);
+  }
+  printf("\n");
 
   T* a_d;
   I* filled_d;
+  I* nnz_per_block_d;
   cudaMalloc(&a_d, nnz*sizeof(T));
   cudaMalloc(&filled_d, num_words*sizeof(I));
+  cudaMalloc(&nnz_per_block_d, num_blocks*sizeof(I));
   cudaMemcpy(a_d, a.data(), nnz*sizeof(T), cudaMemcpyHostToDevice);
   cudaMemcpy(filled_d, filled.data(), num_words*sizeof(I), cudaMemcpyHostToDevice);
+  cudaMemcpy(nnz_per_block_d, nnz_per_block.data(), num_blocks*sizeof(I), cudaMemcpyHostToDevice);
   cudaDeviceSynchronize();
 
   auto begin = std::chrono::high_resolution_clock::now();
-  sparse_iteration<<<1, block_size, block_size * (sizeof(T) + sizeof(I))>>>(a_d, filled_d, nnz);
+  sparse_iteration<<<1, block_size, block_size * (sizeof(T) + sizeof(I))>>>(a_d, filled_d, nnz_per_block_d, m*n);
   cudaDeviceSynchronize();
   auto end = std::chrono::high_resolution_clock::now();
   double duration = std::chrono::duration<double>(end - begin).count();
