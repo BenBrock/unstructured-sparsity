@@ -2,6 +2,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <chrono>
+#include <unordered_set>
 
 #include <cub/cub.cuh>
 
@@ -79,7 +80,7 @@ __global__ void sparse_iteration(T* packed_values, I* filled, std::size_t n) {
       vals_consumed += consumed;
       n_consumed += block_size;
 
-      if (threadIdx.x == 0 && print) {
+      if (print && threadIdx.x == 0) {
         printf("Iteration %lu: %d values consumed\n", iteration, consumed);
       }
 
@@ -89,14 +90,31 @@ __global__ void sparse_iteration(T* packed_values, I* filled, std::size_t n) {
 }
 
 int main(int argc, char** argv) {
-  std::size_t m = 10000;
-  std::size_t n = 10000;
-  std::size_t nnz = m*n / 2;
+  std::size_t m = 40000;
+  std::size_t n = 40000;
+  std::size_t nnz = 0.5 * m*n;
+
+  printf("Generating matrix with %lu nnz (%lf%% filled)\n", nnz, 100*(double(nnz) / (m*n)));
 
   using T = float;
   using I = int;
 
   auto&& [values, rowptr, colind, shape, _] = generate_csr<T, I>(m, n, nnz);
+
+  std::size_t counted_nnz = 0;
+  std::size_t duplicate_nnz = 0;
+  spa_set<I> column_indices(n);
+  for (I i = 0; i < m; i++) {
+    column_indices.clear();
+    for (I j_ptr = rowptr[i]; j_ptr < rowptr[i+1]; j_ptr++) {
+      counted_nnz++;
+      if (column_indices.contains(colind[j_ptr])) {
+        duplicate_nnz++;
+      }
+    }
+  }
+
+  printf("Counted %lu NNZ, %lu duplicate column indices\n", counted_nnz, duplicate_nnz);
 
   auto bits_per_word = sizeof(I)*8;
 
@@ -106,8 +124,8 @@ int main(int argc, char** argv) {
   std::vector<I> filled(num_words, I(0));
   a.reserve(nnz);
 
-  for (int i = 0; i < m; i++) {
-    for (int j_ptr = rowptr[i]; j_ptr < rowptr[i+1]; j_ptr++) {
+  for (I i = 0; i < m; i++) {
+    for (I j_ptr = rowptr[i]; j_ptr < rowptr[i+1]; j_ptr++) {
       auto j = colind[j_ptr];
       auto v = values[j_ptr];
       a.push_back(v);
@@ -119,6 +137,19 @@ int main(int argc, char** argv) {
       filled[element] |= (0x1 << bit);
     }
   }
+
+
+  std::size_t num_elements = 0;
+  for (std::size_t idx = 0; idx < m*n; idx++) {
+    auto element = idx / bits_per_word;
+    auto bit = idx % bits_per_word;
+    bool present = filled[element] & (0x1 << bit);
+    if (present) {
+      num_elements++;
+    }
+  }
+
+  printf("Counted %lu num_elements\n", num_elements);
 
   T* a_d;
   I* filled_d;
@@ -140,25 +171,26 @@ int main(int argc, char** argv) {
   printf("%lf GB/s\n", mbytes / duration);
 
   std::size_t block_id = 0;
+  std::size_t total_count = 0;
   for (std::size_t i = 0; i < m*n; i += block_size) {
     std::size_t count = 0;
-    // printf("Block %lu: \n", block_id);
     for (std::size_t j = i; j < std::min(m*n, i+block_size); j++) {
       // Write to the idx'th bit of `filled`
       auto element = j / bits_per_word;
       auto bit = j % bits_per_word;
       bool has_value = filled[element] & (0x1 << bit);
-      // printf("%d ", has_value);
       if (has_value) {
         count++;
+        total_count++;
       }
     }
-    // printf("\n");
-    printf("Block %lu has %lu values\n", block_id, count);
+    // printf("Block %lu has %lu/%d values\n", block_id, count, block_size);
     block_id++;
-    if (block_id > 10)
-      break;
+    // if (block_id > 10)
+    //  break;
   }
+
+  assert(total_count == nnz);
 
   return 0;
 }
