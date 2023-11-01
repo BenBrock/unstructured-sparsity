@@ -36,6 +36,7 @@ __device__ auto sparse_iteration_block(T* packed_values, I* filled, T* unpacked,
 
   indices_type* indices = (indices_type*) shared_memory;
 
+  indices[tid] = 0;
   bool has_value;
   // indices[idx] = idx'th set bit of `filled`
   if (tid < n) {
@@ -48,26 +49,16 @@ __device__ auto sparse_iteration_block(T* packed_values, I* filled, T* unpacked,
 
     if (has_value) {
       indices[idx] = 1;
-    } else {
-      indices[idx] = 0;
     }
-  } else {
-    indices[tid] = 0;
   }
 
   // Perform prefix_sum on [indices, indices + n)
   // Specialize BlockScan for a 1D block of 128 threads of type int
-  typedef cub::BlockScan<I, block_size> BlockScan;
+  typedef cub::BlockScan<indices_type, block_size> BlockScan;
   __shared__ typename BlockScan::TempStorage temp_storage;
 
-  if (tid < n) {
-    BlockScan(temp_storage).ExclusiveSum(indices[tid], indices[tid]);
-  } else {
-    int dummy_value = 0;
-    BlockScan(temp_storage).ExclusiveSum(dummy_value, dummy_value);
-  }
+  BlockScan(temp_storage).ExclusiveSum(indices[tid], indices[tid]);
 
-  // Could also increment by `n`, which may be smaller than `block_size`
   T* values = (T*) (indices + block_size);
 
   if (tid < n) {
@@ -83,6 +74,8 @@ __device__ auto sparse_iteration_block(T* packed_values, I* filled, T* unpacked,
   auto idx = n - 1;
 
   bool last_filled = (0x1 << (idx % bits_per_word)) & filled[idx / bits_per_word];
+
+  __syncthreads();
 
   return (indices[n-1] - indices[0]) + last_filled;
 }
@@ -120,8 +113,8 @@ __global__ void sparse_iteration(T* packed_values, I* filled, I* block_offsets, 
 }
 
 int main(int argc, char** argv) {
-  std::size_t m = 100;
-  std::size_t n = 100;
+  std::size_t m = 10000;
+  std::size_t n = 10000;
   std::size_t nnz = 0.5 * m*n;
 
   printf("Generating matrix with %lu nnz (%lf%% filled)\n", nnz, 100*(double(nnz) / (m*n)));
@@ -253,7 +246,7 @@ int main(int argc, char** argv) {
 
   assert(num_elements == nnz);
 
-  std::size_t num_blocks = 1;
+  std::size_t num_blocks = 200;
 
   std::size_t words_per_block = (filled.size() + num_blocks - 1) / num_blocks;
   std::vector<I> nnz_per_block(num_blocks, 0);
@@ -271,6 +264,9 @@ int main(int argc, char** argv) {
     printf("%d ", nnz_per_block[i]);
   }
   printf("\n");
+
+  printf("Each block will process %lu bits of `filled` (~%lu iterations)\n",
+         words_per_block*bits_per_word, words_per_block / block_size);
 
   T* a_d;
   I* filled_d;
