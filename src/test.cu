@@ -8,15 +8,6 @@
 
 #include "generate.hpp"
 
-template <std::ranges::range R>
-void print_range(std::string label, R&& r) {
-  printf("%s: [", label.c_str());
-  for (auto&& x : r) {
-    printf("%f, ", x);
-  }
-  printf("]\n");
-}
-
 inline constexpr auto warp_size = 32;
 inline constexpr auto block_size = 128;
 
@@ -106,9 +97,6 @@ __global__ void sparse_iteration(T* packed_values, I* filled, I* block_offsets, 
   auto values_offset = block_offsets[blockIdx.x];
   auto filled_offset = words_per_block*blockIdx.x;
   auto block_unpacked = unpacked + filled_offset*bits_per_word;
-  if (threadIdx.x == 0) {
-    printf("Block %d has values offset %d, filled offset %lu\n", blockIdx.x, values_offset, filled_offset*bits_per_word);
-  }
   sparse_iteration(packed_values + values_offset, filled + filled_offset, block_unpacked, min(words_per_block*bits_per_word, n - blockIdx.x*words_per_block));
 }
 
@@ -122,8 +110,10 @@ int main(int argc, char** argv) {
   using T = float;
   using I = int;
 
+  // Generate sparse matrix.
   auto&& [values, rowptr, colind, shape, _] = generate_csr<T, I>(m, n, nnz);
 
+  // Analyze sparse matrix to ensure no duplicate column indices.
   std::size_t counted_nnz = 0;
   std::size_t duplicate_nnz = 0;
   spa_set<I> column_indices(n);
@@ -139,25 +129,19 @@ int main(int argc, char** argv) {
 
   printf("Counted %lu NNZ, %lu duplicate column indices\n", counted_nnz, duplicate_nnz);
 
+  // Generate `filled` bitarray with nonzero pattern.
+
   auto bits_per_word = sizeof(I)*8;
 
   auto num_words = (m*n + bits_per_word - 1) / bits_per_word;
 
-  std::vector<T> a;
   std::vector<I> filled(num_words, I(0));
-  a.reserve(nnz);
-
-  std::vector<bool> filled_b(m*n, false);
-  std::vector<T> a_b(m*n, 0);
 
   for (I i = 0; i < m; i++) {
     for (I j_ptr = rowptr[i]; j_ptr < rowptr[i+1]; j_ptr++) {
       auto j = colind[j_ptr];
       auto v = values[j_ptr];
-      a.push_back(v);
       auto idx = i * n + j;
-      filled_b[idx] = true;
-      a_b[idx] = v;
 
       // Write to the idx'th bit of `filled`
       auto element = idx / bits_per_word;
@@ -166,73 +150,7 @@ int main(int argc, char** argv) {
     }
   }
 
-  assert(a.size() == nnz);
-
-  std::vector<T> unpacked(m*n, 0);
-  std::vector<T> unpacked_b(m*n, 0);
-
-{
-  std::size_t count = 0;
-  std::size_t count2 = 0;
-  for (I idx = 0; idx < m*n; idx++) {
-    auto element = idx / bits_per_word;
-    auto bit = idx % bits_per_word;
-    if (filled[element] & (0x1 << bit)) {
-      unpacked[idx] = a[count++];
-    }
-
-    if (filled_b[idx]) {
-      unpacked_b[idx] = a[count2++];
-    }
-  }
-}
-
-  // assert(unpacked_b == a_b);
-  // fmt::print("unpacked: {}\n", unpacked_b);
-  // fmt::print("a_b: {}\n", a_b);
-  // print_range("unpacked", unpacked_b);
-  // print_range("a", a_b);
-
-/*
-  printf("a:\n");
-  for (std::size_t i = 0; i < m; i++) {
-    for (std::size_t j = 0; j < n; j++) {
-      printf("%2.2f ", a_b[i*n + j]);
-    }
-    printf("\n");
-  }
-
-  printf("unpacked:\n");
-  for (std::size_t i = 0; i < m; i++) {
-    for (std::size_t j = 0; j < n; j++) {
-      printf("%2.2f ", unpacked_b[i*n + j]);
-    }
-    printf("\n");
-  }
-  */
-
-  bool print = false;
-
-  std::size_t count_same = 0;
-  std::size_t count_diff = 0;
-
-  for (I i = 0; i < m; i++) {
-    for (I j_ptr = rowptr[i]; j_ptr < rowptr[i+1]; j_ptr++) {
-      auto j = colind[j_ptr];
-      auto v = values[j_ptr];
-      auto unpacked_value = unpacked_b[i*n + j];
-      if (v == unpacked_value) {
-        count_same++;
-        if (print)
-        printf("(%d, %d): %f = %f\n", i, j, v, unpacked_value);
-      } else {
-        count_diff++;
-        if (print)
-        printf("(%d, %d): %f != %f\n", i, j, v, unpacked_value);
-      }
-    }
-  }
-  printf("same/diff %lu/%lu\n", count_same, count_diff);
+  // Ensure that the filled array has the correct number of nonzeros.
 
   std::size_t num_elements = 0;
   for (std::size_t idx = 0; idx < m*n; idx++) {
@@ -246,7 +164,23 @@ int main(int argc, char** argv) {
 
   assert(num_elements == nnz);
 
+  // Generate local version of the unpacked array.
+  std::vector<T> unpacked(m*n, 0);
+
+{
+  std::size_t count = 0;
+  for (I idx = 0; idx < m*n; idx++) {
+    auto element = idx / bits_per_word;
+    auto bit = idx % bits_per_word;
+    if (filled[element] & (0x1 << bit)) {
+      unpacked[idx] = values[count++];
+    }
+  }
+}
+
   std::size_t num_blocks = 200;
+
+  // Generate array of offsets at which each block should start.
 
   std::size_t words_per_block = (filled.size() + num_blocks - 1) / num_blocks;
   std::vector<I> nnz_per_block(num_blocks, 0);
@@ -268,6 +202,8 @@ int main(int argc, char** argv) {
   printf("Each block will process %lu bits of `filled` (~%lu iterations)\n",
          words_per_block*bits_per_word, words_per_block / block_size);
 
+  // Allocate and copy data to GPU.
+
   T* a_d;
   I* filled_d;
   I* nnz_per_block_d;
@@ -276,12 +212,13 @@ int main(int argc, char** argv) {
   cudaMalloc(&filled_d, num_words*sizeof(I));
   cudaMalloc(&nnz_per_block_d, num_blocks*sizeof(I));
   cudaMallocManaged(&unpacked_d, m*n*sizeof(T));
-  cudaMemcpy(a_d, a.data(), nnz*sizeof(T), cudaMemcpyHostToDevice);
+  cudaMemcpy(a_d, values.data(), nnz*sizeof(T), cudaMemcpyHostToDevice);
   cudaMemcpy(filled_d, filled.data(), num_words*sizeof(I), cudaMemcpyHostToDevice);
   cudaMemcpy(nnz_per_block_d, nnz_per_block.data(), num_blocks*sizeof(I), cudaMemcpyHostToDevice);
   cudaMemset(unpacked_d, 0, m*n*sizeof(T));
   cudaDeviceSynchronize();
 
+  // Launch unpacking kernel on GPU.
   auto begin = std::chrono::high_resolution_clock::now();
   sparse_iteration<<<num_blocks, block_size, block_size * (sizeof(T) + sizeof(I))>>>(a_d, filled_d, nnz_per_block_d, unpacked_d, m*n, words_per_block);
   cudaDeviceSynchronize();
@@ -289,29 +226,12 @@ int main(int argc, char** argv) {
   double duration = std::chrono::duration<double>(end - begin).count();
 
   double mbytes = nnz*sizeof(T) * 1e-6;
+  double gbytes = nnz*sizeof(T) * 1e-9;
 
   printf("Took %lf ms to decompress %lf MB\n", duration*1000, mbytes);
-  printf("%lf GB/s\n", mbytes / duration);
+  printf("%lf GB/s\n", gbytes / duration);
 
-  std::size_t block_id = 0;
-  std::size_t total_count = 0;
-  for (std::size_t i = 0; i < m*n; i += block_size) {
-    std::size_t count = 0;
-    for (std::size_t j = i; j < std::min(m*n, i+block_size); j++) {
-      // Write to the idx'th bit of `filled`
-      auto element = j / bits_per_word;
-      auto bit = j % bits_per_word;
-      bool has_value = filled[element] & (0x1 << bit);
-      if (has_value) {
-        count++;
-        total_count++;
-      }
-    }
-    // printf("Block %lu has %lu/%d values\n", block_id, count, block_size);
-    block_id++;
-    // if (block_id > 10)
-    //  break;
-  }
+  // Compare to original sparse matrix, ensure correct unpacking.
 
   printf("Comparing to original sparse matrix...\n");
 
@@ -323,11 +243,6 @@ int main(int argc, char** argv) {
       auto j = colind[j_ptr];
       auto v = values[j_ptr];
       auto unpacked_value = unpacked_d[i*n + j];
-      if (v == unpacked_value) {
-        // printf("(%d, %d): %f = %f\n", i, j, v, unpacked_d[i*n + j]);
-      } else {
-        // printf("(%d, %d): %f != %f\n", i, j, v, unpacked_d[i*n + j]);
-      }
 
       if (v != unpacked_value) {
         incorrect_values++;
@@ -384,31 +299,6 @@ int main(int argc, char** argv) {
   } else {
     printf("Values OK compared to CPU unpacked data.\n");
   }
-
-  assert(total_count == nnz);
-
-  std::size_t same_count = 0;
-  std::size_t diff_count = 0;
-  for (std::size_t i = 0; i < m*n; i++) {
-    if (unpacked_d[i] == unpacked[i]) {
-      same_count++;
-    } else {
-      diff_count++;
-    }
-  }
-  printf("same count: %lu\n", same_count);
-  printf("diff count: %lu\n", diff_count);
-  // assert(same_count == m*n);
-
-/*
-  printf("unpacked_d:\n");
-  for (std::size_t i = 0; i < m; i++) {
-    for (std::size_t j = 0; j < n; j++) {
-      printf("%2.2f ", unpacked_d[i*n + j]);
-    }
-    printf("\n");
-  }
-  */
 
   return 0;
 }
