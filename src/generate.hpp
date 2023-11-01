@@ -121,6 +121,12 @@ auto generate_csr(I m, I n, std::size_t nnz, std::size_t seed = 0) {
     }
   }
 
+  for (std::size_t i = 0; i < m; i++) {
+    auto row_first = colind.begin() + rowptr[i];
+    auto row_last = colind.begin() + rowptr[i+1];
+    std::sort(row_first, row_last);
+  }
+
   std::size_t counted_nnz = 0;
   std::size_t duplicate_nnz = 0;
   spa_set<I> column_indices(n);
